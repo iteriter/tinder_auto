@@ -1,0 +1,3 @@
+[submodule "TinderBotz"]
+	path = TinderBotz
+	url = git@github.com:iteriter/TinderBotz.git
