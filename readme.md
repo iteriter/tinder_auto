@@ -6,7 +6,7 @@ Intended functionality is to support two modes:
 * __autonomous__ - where the script makes swiping decision based on the user's preferences learned during _training_;
 
 #### Changes to TinderBotz
-The script uses [TinderBotz fork](https://github.com/frederikme/TinderBotz) which was updated slightly to work with the latest Tinder html layout.
+The script uses [TinderBotz fork](https://github.com/iteriter/TinderBotz) which was updated slightly to work with the latest Tinder html layout.
 
 ### Instructions
 0. poetry is used for dependency management; Install it [here](https://python-poetry.org/);
