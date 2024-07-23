@@ -1,22 +1,24 @@
+import abc
 import argparse
-import enum
-import json
-import re
 import sys
-from typing import Literal, Optional
-from pathlib import Path
-import requests
-
+import random
 import time
+from typing import Optional
+from pathlib import Path
+import os
+
 from loguru import logger
+from common import SwipeAction
 
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.wait import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from events import catch_swipe_by_network_request
+from session import PersistentSession
+from storage import ProfileStore, record_geomatch
 
-from tinderbotz.session import Session
+from timer import catchtime
 from tinderbotz.helpers.geomatch import Geomatch
+from tinderbotz.helpers.geomatch_helper import GeomatchHelper
 from tinderbotz.helpers.xpaths import content
+from tinderbotz.session import Session
 
 
 logger.remove()
@@ -24,8 +26,6 @@ logger.remove()
 
 AUTH_FILE = "auth.txt"
 USER_SESSION_FILE = ".session.json"
-
-X_PROFILE_PATH = f"{content}/div/div[1]/div/main/div[1]/div/div/div[1]/div[1]/div/div[2]/div[1]/div/div[1]/div/h1"
 
 parser = argparse.ArgumentParser(
     prog="tinder_auto",
@@ -76,245 +76,120 @@ parser.add_argument(
 )
 
 
-class SwipeAction(str, enum.Enum):
-    Like = "like"
-    Dislike = "dislike"
-    Superlike = "superlike"
+class Matchmaker(abc.ABC):
+    @abc.abstractmethod
+    def decide(self, profile: Geomatch) -> SwipeAction:
+        pass
 
 
-class PersistentSession(Session):
-    def __init__(self, session_file: Optional[Path] = None, *args, **kwargs):
-        self.session_data = session_file
-        super().__init__(*args, **kwargs)
+class RandomMatchmaker(Matchmaker):
+    def __init__(self, ratio: int) -> None:
+        super().__init__()
 
-    def login(self, auth_file: Path, auth_mode: Literal["phone", "facebook", "google"]):
-        self.browser.get("https://tinder.com/")
-        time.sleep(3)
+        if not 0 < ratio < 100:
+            raise ValueError("ratio must be between 1 and 99%")
 
-        # try to login with session data
-        with open("session.json", "r") as f:
-            session_data = json.loads(f.read())
-            self.set_local_storage(**session_data["localStorage"])
-            self.set_indexed_db(**session_data["db"])
+        self.threshold = ratio / 100
 
-        time.sleep(3)
-
-        self.browser.refresh()
-        if self._is_logged_in():
-            return
-
-        # try logging in manually
-        auth_data = auth_file.read_text().strip().split(":")
-
-        if not len(auth_data) == 2:
-            raise ValueError("invalid authentication data provided")
-
-        auth_func = None
-        match auth_mode:
-            case "phone":
-                auth_func = self.login_using_sms
-            case "facebook":
-                auth_func = self.login_using_facebook
-            case "google":
-                auth_func = self.login_using_google
-            case _:
-                raise NotImplementedError
-
-        auth_func(*auth_data)
-
-        # todo: save session after authorization
-        # self.save_session()
-
-    def set_local_storage(self, **kwargs):
-        for key, value in kwargs.items():
-            self.browser.execute_script(
-                "window.localStorage.setItem(arguments[0], arguments[1]);", key, value
-            )
-
-    def set_indexed_db(self, **kwargs):
-        """
-        Connect to Tinder's storage in IndexedDB
-        and set session data to reuse login
-        """
-        sessionValues = "\n".join(
-            [
-                f"await server.keyval.put({{key: {json.dumps(key)}, item: {json.dumps(value)}}});"
-                for key, value in kwargs.items()
-            ]
-        )
-
-        script = f"""
-            (async () => {{
-            const onDbLoad = async () => {{
-                    const server = await db.open({{server: "keyval-store"}});
-                    {sessionValues}
-            }}
-
-            const script = document.createElement("script")
-            script.type = "text/javascript"
-            script.src = "https://rawcdn.githack.com/aaronpowell/db.js/11b4b071573e571389655927f8574b2b89723b04/dist/db.min.js"
-            script.addEventListener("load", onDbLoad)
-            document.getElementsByTagName("head")[0].appendChild(script);
-            }})();
-        """
-
-        self.browser.execute_script(script)
-
-    def save_session(self):
-        """
-        Dump session data from local storage
-        to reuse when logging in
-        """
-        raise NotImplementedError
+    def decide(self, *args, **kwargs):
+        if random.random() < self.threshold:
+            return SwipeAction.Like
+        else:
+            return SwipeAction.Dislike
 
 
-def catch_swipe_by_js_events(session, timeout) -> SwipeAction:
-    event_catch_script = Path("swipeEventListener.js").read_text()
-    session.browser.execute_script(event_catch_script)
-
-    logger.info("You can swipe now!")
-
-    user_swipe_event_element = WebDriverWait(
-        session.browser, timeout=timeout, poll_frequency=0.1
-    ).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, '[class^="userSwipeAction"]'))
-    )
-
-    swipe_event = user_swipe_event_element.get_attribute("value")
-    logger.debug(
-        f"Swipe Event element was located, got event: {swipe_event}"
-    )
-
-    logger.info(f"Swipe catched -- {swipe_event}")
-    logger.info("Please wait while the profile is being processed...")
-
-    # remove event element
-    session.browser.execute_script(
-        """
-                                   var eventDivs = document.getElementsByClassName("userSwipeAction");
-                                   while (eventDivs[0]) {
-                                    eventDivs[0].parentNode.removeChild(eventDivs[0]);
-                                   }
-                                   """
-    )
-
-    logger.debug("Waiting for the event element to be removed")
-    user_swipe_event_element = WebDriverWait(
-        session.browser, timeout=timeout, poll_frequency=0.1
-    ).until_not(
-        EC.presence_of_element_located((By.CSS_SELECTOR, '[class^="userSwipeAction"]'))
-    )
-    logger.debug("Event element removed")
-
-    return SwipeAction(swipe_event)
-
-
-class ProfileStore:
-    def __init__(self, folder: Path) -> None:
-        # init file for recording profile/image ids
-
-        if folder.exists() and folder.is_file():
-            raise ValueError("output path should point to a folder")
-
-        folder.mkdir(
-            parents=True, exist_ok=True
-        )  # create output folder if doesn't exist
-        self.outfile = folder / "out.txt"
-        self.outfile.touch()
-
-        # init folder for storing images
-        (folder / "images").mkdir(exist_ok=True)
-        self.image_folder = folder / "images"
-
-        self.last_entry_id = 0
-
-        # update last entry id if there is some data already
-        with open(self.outfile, "r+") as f:
-            if len((lines := f.readlines()) and lines[-1]) > 0:
-                max_existing_id = int(lines[-1].split(":")[0])
-                self.last_entry_id = max_existing_id + 1
-
-    def save_profile(self, action: str, image_urls: list[str]):
-        image_path = self.image_folder / f"{self.last_entry_id}.jpg"
-        for url in image_urls:
-            matched = re.match(r'url\("(.+)"\)', url)
-
-            if not matched:
-                continue
-            url = matched.group(1)
-
-            try:
-                r = requests.get(url)
-            except Exception as e:
-                logger.error(f"error getting an image from url: {url}")
-                logger.error(e)
-                continue
-            if not 200 <= r.status_code <= 299:
-                logger.error(f"got error code {r.status_code} for url: {url}")
-                continue
-
-            # ext = os.path.splitext(url)[-1]
-            logger.debug(f"saving image to {image_path}")
-
-            with open(image_path, "wb") as f:
-                f.write(r.content)
-
-            # we only want to store one image
-            break
-
-        # record swipe for the profile
-        with open(self.outfile, "a") as profiles:
-            profiles.write(f"{self.last_entry_id}:{action}\n")
-
-        self.last_entry_id += 1
-
-
-def record_geomatch(storage: ProfileStore, geomatch: Optional[Geomatch], action: str):
-    if not geomatch:
-        logger.error("faled to get a Geomatch informatin")
-        return False
-
-    name, images = geomatch.name, geomatch.image_urls
-    if not name or not images:
-        logger.info("Geomatch is missing name or images, skipping...")
-        return False
-
-    # save profile image and record swipe action
-    logger.info(f"Saving match record for {name}")
-    storage.save_profile(action, images)
-
-    return True
-
-
-def launch_training(auth_file, auth_mode, idle_timeout, out_folder):
-    """"""
-    storage = ProfileStore(out_folder)
-
-    # launch selenium driver, try to login with stored sesssion if exists, otherwise use user credentials
-    session = PersistentSession(session_file=Path(USER_SESSION_FILE))
-    session.login(auth_file=auth_file, auth_mode=auth_mode)
-
-    # loop until exited or times out
-    while True:
+def get_geomatch(session: Session) -> Geomatch:
+    with catchtime("parsing profile"):
         geomatch: Optional[Geomatch] = session.get_geomatch(quickload=True)
 
-        logger.info(
-            f"Profile data parsed for {geomatch.name}, got {len(geomatch.image_urls)} image urls"
-        )
+    logger.info(
+        f"Profile data parsed for {geomatch.name}, got {len(geomatch.image_urls)} image urls"
+    )
+    if not geomatch or not (geomatch.name and geomatch.image_urls):
+        raise ValueError("geomatch doesn't have name or images")
+
+    return geomatch
+
+
+def launch_training(storage, session, idle_timeout):
+    """"""
+    # loop until exited or times out
+    while True:
+        logger.debug(f"[SCRIPT] process pid: {os.getpid()}, parent pid: {os.getppid()}")
+
+        logger.info("getting geomatch")
+        try:
+            geomatch = get_geomatch(session)
+        except ValueError as e:
+            logger.error(f"failed to get geomatch info: {e}")
+            input("press enter to continue")
+            continue
 
         # wait for the user action to happen, and get the action type (like/dislike/superlike)
-        action = catch_swipe_by_js_events(session, idle_timeout)
-
-        # map action to the required output values
-        # todo: get mapper implementation dynamically,
-        #       or implement mapping as part of the storage interface
-        action_code = "no" if action == SwipeAction.Dislike else "yes"
+        logger.info("waiting for swipe event")
+        # action = catch_swipe_by_js_events(session, idle_timeout)
+        event = catch_swipe_by_network_request(session, idle_timeout)
 
         # store swipe and profile data
-        record_geomatch(storage, geomatch, action_code)
+        record_geomatch(
+            storage,
+            event,
+            geomatch=geomatch,
+        )
 
         # let the page update after swipe before parsing next match
         time.sleep(2)
+
+
+def run_auto(
+    session, storage, max_runtime: Optional[int] = 15, n_profiles: Optional[int] = None
+):
+    """
+    max_runtime: int = default 15, amount of time in minutes for which
+                       the agent is allowed ro run.
+    """
+    if n_profiles:
+        logger.info(
+            "Number of profiles set as target for the agent. \
+                     max_runtime value will be ignored"
+        )
+        max_runtime = None
+
+        if n_profiles > 100:
+            logger.warning(
+                "Warning! Is it really a good idea to parse more than 100 \
+                            profiles in one session?"
+            )
+
+    if max_runtime and max_runtime > 120:
+        logger.warning(
+            "Warning! Is it really a good idea to let the agent run for \
+                        more than 2 hours?"
+        )
+
+    profiles_swiped = 0
+    while (n_profiles and (profiles_swiped <= n_profiles)) or (
+        max_runtime and True
+    ):  # todo: update to check conditions above
+        geomatch = get_geomatch(session)
+
+        action: SwipeAction = RandomMatchmaker(ratio=70).decide(geomatch)
+        helper = GeomatchHelper(browser=session.browser)
+
+        match action:
+            case SwipeAction.Superlike:
+                # todo: handle out of superlikes
+                helper.superlike()
+            case SwipeAction.Like:
+                helper.like()
+            case SwipeAction.Dislike:
+                helper.dislike()
+        # i wanted to do "getattr(helper, action.value)()" but its probably too unreadable :P
+
+        profiles_swiped += 1
+        # todo: save profile
+
+        # todo: sleep for random amount of time
 
 
 if __name__ == "__main__":
@@ -322,12 +197,18 @@ if __name__ == "__main__":
 
     logger.add(sys.stderr, level=args.log_level)
 
+    storage = ProfileStore(args.out)
+
+    # launch selenium driver, try to login with stored sesssion if exists, otherwise use user credentials
+    session = PersistentSession(session_file=Path(USER_SESSION_FILE))
+    while not session._is_logged_in():
+        session.login(auth_file=args.auth_file, auth_mode=args.auth_type)
+
     if args.mode == "training":
         launch_training(
-            auth_file=args.auth_file,
-            auth_mode=args.auth_type,
+            session=session,
+            storage=storage,
             idle_timeout=args.timeout,
-            out_folder=args.out,
         )
     elif args.mode == "auto":
         raise NotImplementedError
