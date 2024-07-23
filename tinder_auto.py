@@ -17,7 +17,6 @@ from storage import ProfileStore, record_geomatch
 from timer import catchtime
 from tinderbotz.helpers.geomatch import Geomatch
 from tinderbotz.helpers.geomatch_helper import GeomatchHelper
-from tinderbotz.helpers.xpaths import content
 from tinderbotz.session import Session
 
 
@@ -111,12 +110,53 @@ def get_geomatch(session: Session) -> Geomatch:
     return geomatch
 
 
+class Trainer:
+    def __init__(
+        self, *, session: Session, storage: ProfileStore, idle_timeout: int = 300
+    ) -> None:
+        self.session = session
+        self.storage = storage
+        self.idle_timeout = idle_timeout
+
+        self.helper = GeomatchHelper(browser=session.browser)
+        self.match = None
+
+    def next(self, action: SwipeAction | None):
+        logger.debug(f"[SCRIPT] process pid: {os.getpid()}, parent pid: {os.getppid()}")
+        logger.info("getting geomatch")
+
+        match action:
+            case SwipeAction.Like:
+                self.helper.like()
+            case SwipeAction.Dislike:
+                self.helper.dislike()
+            case _:
+                pass
+
+        if action is not None:
+            event = catch_swipe_by_network_request(self.session, self.idle_timeout)
+
+            # store swipe and profile data
+            record_geomatch(
+                storage,
+                event,
+                geomatch=self.match,
+            )
+
+            # let the page update after swipe before parsing next match
+            time.sleep(2)
+            self.match = get_geomatch(self.session)
+        elif not self.match:
+            self.match = get_geomatch(self.session)
+
+        yield self.match
+
+
 def launch_training(storage, session, idle_timeout):
     """"""
     # loop until exited or times out
     while True:
         logger.debug(f"[SCRIPT] process pid: {os.getpid()}, parent pid: {os.getppid()}")
-
         logger.info("getting geomatch")
         try:
             geomatch = get_geomatch(session)
@@ -192,17 +232,23 @@ def run_auto(
         # todo: sleep for random amount of time
 
 
+def init(out: Path, log_level: str = "INFO", session_kwargs: dict | None = None):
+    if not session_kwargs:
+        session_kwargs = {}
+
+    logger.add(sys.stderr, level=log_level)
+    storage = ProfileStore(out)
+    # launch selenium driver, try to login with stored sesssion if exists, otherwise use user credentials
+    session = PersistentSession(session_file=Path(USER_SESSION_FILE), **session_kwargs)
+    while not session._is_logged_in():
+        session.login(auth_file=args.auth_file, auth_mode=args.auth_type)
+    return storage, session
+
+
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    logger.add(sys.stderr, level=args.log_level)
-
-    storage = ProfileStore(args.out)
-
-    # launch selenium driver, try to login with stored sesssion if exists, otherwise use user credentials
-    session = PersistentSession(session_file=Path(USER_SESSION_FILE))
-    while not session._is_logged_in():
-        session.login(auth_file=args.auth_file, auth_mode=args.auth_type)
+    storage, session = init(out=args.out, log_level=args.log_level)
 
     if args.mode == "training":
         launch_training(
